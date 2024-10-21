@@ -1,0 +1,179 @@
+;; Timer smart-contract for scheduling messages.
+#include "imports/stdlib.fc";
+
+const int milliton = 1000000;
+const int ton      = 1000000000;
+const int MOD      = 998244353;
+
+const int op::set_owner  = 1;
+const int op::set_caller  = 2;
+const int op::schedule   = 0x24E5F1CA;    ;; zlib.crc32(b'op::schedule')
+
+
+(cell, ()) udict_new_ref(cell dict, int key_len, int index, cell value) impure asm(value index dict key_len) "DICTUADDREF 170 THROWIFNOT";
+int equal_slices(slice a, slice b) asm "SDEQ";
+
+cell get_bounce_msg(slice bounce_address) inline {
+  return begin_cell()
+    .store_uint(0x18, 6)
+    .store_slice(bounce_address)
+    .store_coins(10 * milliton)
+    .store_uint(0, 107)
+    .end_cell();
+}
+
+cell get_bounty_msg(slice caller, int actual_bounty) inline {
+  return begin_cell()
+    .store_uint(0x10, 6)
+    .store_slice(caller)
+    .store_coins(actual_bounty)
+    .store_uint(0, 107)
+    .store_uint(4, 32) ;; op_code == 4
+    .end_cell();
+}
+
+(cell, slice, slice, int, slice) load_contract() inline {
+  slice ds = get_data().begin_parse();
+  cell schedule = ds~load_dict();
+  slice owner = ds~load_msg_addr();
+  slice caller = ds~load_msg_addr();
+  int furthest_schedule = ds~load_uint(64);
+  slice timer_bounce_address = ds~load_msg_addr();
+  return (schedule, owner, caller, furthest_schedule, timer_bounce_address);
+}
+
+cell serialize_contract(cell schedule, slice owner, slice caller, int furthest, slice timer_bounce_address) inline {
+  return begin_cell()
+    .store_dict(schedule)
+    .store_slice(owner)
+    .store_slice(caller)
+    .store_uint(furthest, 64)
+    .store_slice(timer_bounce_address)
+    .end_cell();
+}
+
+int load_workchain() inline {
+  ;; in case someone accidentaly deploys timer in masterchain
+  (int workchain, _) = parse_std_addr(my_address());
+  return workchain;
+}
+
+(slice, ()) load_state_init(slice cs) impure inline {
+  if (cs~load_uint(1)) { cs~skip_bits(5); }     ;; Maybe (## 5)
+  if (cs~load_uint(1)) { cs~skip_bits(2); }     ;; Maybe TickTock
+  if (cs~load_uint(1)) { cs~load_ref();   }     ;; Maybe ^Cell
+  if (cs~load_uint(1)) { cs~load_ref();   }     ;; Maybe ^Cell
+  cs~load_dict();
+  return (cs, ());
+}
+
+(cell, int) do_schedule((cell, slice, slice, int) old_state, slice sender, int time, slice timer_bounce_address, cell msg) impure inline {
+  (cell schedule, slice owner, slice caller, int furthest) = old_state;
+  
+  if (dict_empty?(schedule)) {
+    furthest = now();
+  }
+  if (time > furthest) {
+    caller = sender;
+    furthest = time;
+  }
+  schedule~udict_new_ref(96, (time << 32) | (cur_lt() % MOD), msg);
+  cell new_storage = serialize_contract(schedule, owner, caller, furthest, timer_bounce_address);
+  
+  int reserve = 100 * milliton;
+  
+  return (new_storage, reserve);
+}
+
+int continue_parsing(int success, int scheduled_at, int current_time) inline {
+  ;; lazy evaluation required, because `scheduled_at` is nullable
+  if (~ success) {
+    return 0;
+  }
+  return current_time >= (scheduled_at >> 32);
+}
+
+(cell, ()) process_schedule(cell scheduled) impure inline {
+  int current_time = now();
+  
+  (int scheduled_at, cell scheduled_msg, int success) = udict_get_min_ref?(scheduled, 96);
+  while (continue_parsing(success, scheduled_at, current_time)) {
+    int t = scheduled~udict_delete?(96, scheduled_at);
+    (scheduled_at, scheduled_msg, success) = udict_get_min_ref?(scheduled, 96);
+  }
+  
+  return (scheduled, ());
+}
+
+() recv_internal(int coins, cell in_msg_full, slice in_msg_body) {
+  slice in_msg = in_msg_full.begin_parse();
+  
+  if (in_msg~load_uint(4) & 1) {
+    ;; bounced message: tick
+    slice sender = in_msg~load_msg_addr();
+    (cell scheduled, slice owner, slice caller, int furthest, slice timer_bounce_address) = load_contract();
+    throw_unless(105, equal_slice_bits(sender, timer_bounce_address));
+
+    accept_message();
+    scheduled~process_schedule();
+    
+    set_data(serialize_contract(scheduled, owner, caller, furthest, timer_bounce_address));
+    if (dict_empty?(scheduled)) {
+      send_raw_message(get_bounty_msg(caller, 0), 129);       ;; destroying timer
+    } else {
+      send_raw_message(get_bounce_msg(timer_bounce_address), 1);
+    }
+  } else {
+    if (in_msg_body.slice_empty?()) {
+
+    } else {
+      int op_code = in_msg_body~load_uint(32);    
+      if (op_code == op::set_owner) { ;; update owner address
+        slice sender = in_msg~load_msg_addr();
+        slice new_owner = in_msg_body~load_msg_addr();
+        (cell scheduled, slice owner, slice caller, int furthest, slice timer_bounce_address) = load_contract();
+        throw_unless(103, equal_slice_bits(sender, owner));
+        set_data(serialize_contract(scheduled, new_owner, caller, furthest, timer_bounce_address));
+
+      } elseif (op_code == op::set_caller) { ;; update caller address
+        slice sender = in_msg~load_msg_addr();
+        slice new_caller = in_msg_body~load_msg_addr();
+        (cell scheduled, slice owner, slice caller, int furthest, slice timer_bounce_address) = load_contract();
+        throw_unless(103, equal_slice_bits(sender, owner));
+        set_data(serialize_contract(scheduled, owner, new_caller, furthest, timer_bounce_address));
+
+      } elseif (op_code == op::schedule) { ;; schedule timer
+        slice sender = in_msg~load_msg_addr();
+        int time = in_msg_body~load_uint(64);
+        cell msg = in_msg_body~load_ref();
+        
+        (cell scheduled, slice owner, slice caller, int furthest, slice timer_bounce_address) = load_contract();
+        throw_unless(104, equal_slice_bits(sender, caller));
+        ;; clear the dict if the last transaction failed
+        (int scheduled_at, cell scheduled_msg, int success) = udict_get_min_ref?(scheduled, 96);
+        while (success == -1) { ;; while success
+          int t = scheduled~udict_delete?(96, scheduled_at);
+          (scheduled_at, scheduled_msg, success) = udict_get_min_ref?(scheduled, 96);
+        }
+
+        (cell new_storage, int required_coins) = do_schedule((scheduled, owner, caller, furthest), sender, time, timer_bounce_address, msg);
+        
+        if (dict_empty?(scheduled)) {
+          send_raw_message(get_bounce_msg(timer_bounce_address), 1);
+        }
+        set_data(new_storage);
+      }
+    }
+  }
+}
+
+(cell, slice, slice, int, slice) get_contract_storage_data() method_id {
+  var (schedule, owner, caller, furthest_schedule, timer_bounce_address) = load_contract();
+  return (
+    schedule,
+    owner,
+    caller,
+    furthest_schedule,
+    timer_bounce_address
+  );
+}
